@@ -92,12 +92,11 @@ nginx-dstat.service:
     After=multi-user.target
     
     [Service]
-    ExecStart=/root/nginx-dstat/nginx-dstat \
+    ExecStart=/root/nginx-dstat/nginx-dstat -from-start \
         -addr :8080 \
         -log /var/log/nginx/access.log \
         -status http://127.0.0.1/nginx_status \
         -interval 1300ms
-        -from-start
     Restart=always
     User=root
     
