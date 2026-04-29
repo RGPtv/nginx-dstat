@@ -1,5 +1,5 @@
 
-# nginx-dstat — quick start
+# NGINX-DSTAT
 
 ## Requirements
 - Go 1.21+
