@@ -10,17 +10,29 @@
 
 ## 1. Apply nginx config
 
-Copy the relevant blocks from nginx-snippet.conf into your nginx config,
-then reload:
+Copy this config:
 
-    location /nginx_status {
-        stub_status on;
-        allow 127.0.0.1;
-        deny  all;
-        access_log off;
+    server {
+        listen 127.0.0.1:80;          # localhost only — never expose to the internet
+        server_name localhost;
+    
+        # Allow access ONLY from loopback
+        location /nginx_status {
+            stub_status on;
+            allow 127.0.0.1;
+            deny  all;
+            access_log off;
+        }
+    
+        # Optionally block all other paths on this internal vhost
+        location / {
+            return 444;
+        }
     }
 
-After applying the config:
+    access_log /var/log/nginx/access.log combined;
+
+Reload after applying the config:
 
     sudo nginx -t && sudo nginx -s reload
 
