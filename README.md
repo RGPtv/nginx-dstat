@@ -10,7 +10,11 @@
 
 ## 1. Apply nginx config
 
-Copy this config:
+Edit your nginx config:
+
+    nano /etc/nginx/nginx.conf
+
+Add this inside your http {} block:
 
     server {
         listen 127.0.0.1:80;          # localhost only — never expose to the internet
@@ -30,7 +34,7 @@ Copy this config:
         }
     }
 
-    access_log /var/log/nginx/access.log combined;
+    access_log /var/log/nginx/access.log combined;       # Find access log and replace it with this
 
 Reload after applying the config:
 
@@ -73,10 +77,32 @@ Open your browser at:  http://YOUR-SERVER-IP:8765
 
 ## 4. Run as a systemd service (optional)
 
-Copy nginx-dstat.service to /etc/systemd/system/, then:
+Create nginx-dstat.service to /etc/systemd/system/:
+
+    sudo nano /etc/systemd/system/nginx-dstat.service
+
+nginx-dstat.service:
+
+    [Unit]
+    Description=Wireless Controller
+    After=multi-user.target
+    
+    [Service]
+    ExecStart=/root/nginx-dstat/nginx-dstat \
+        -addr :8080 \
+        -log /var/log/nginx/access.log \
+        -status http://127.0.0.1/nginx_status \
+        -interval 1300ms
+    Restart=always
+    User=root
+    
+    [Install]
+    WantedBy=multi-user.target
+
+Reload and start the service:
 
     sudo systemctl daemon-reload
-    sudo systemctl enable --now nginx-dstat
+    sudo systemctl restart nginx-dstat
     sudo systemctl status nginx-dstat
 
 ---
