@@ -44,6 +44,10 @@ Verify stub_status is working:
 
     curl http://127.0.0.1/nginx_status
 
+Test log access:
+
+    tail -f /var/log/nginx/access.log
+
 ---
 
 ## 2. Build the Go server
