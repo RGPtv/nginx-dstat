@@ -97,6 +97,7 @@ nginx-dstat.service:
         -log /var/log/nginx/access.log \
         -status http://127.0.0.1/nginx_status \
         -interval 1300ms
+        -from-start
     Restart=always
     User=root
     
