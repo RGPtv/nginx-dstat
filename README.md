@@ -13,6 +13,15 @@
 Copy the relevant blocks from nginx-snippet.conf into your nginx config,
 then reload:
 
+    location /nginx_status {
+        stub_status on;
+        allow 127.0.0.1;
+        deny  all;
+        access_log off;
+    }
+
+After applying the config:
+
     sudo nginx -t && sudo nginx -s reload
 
 Verify stub_status is working:
