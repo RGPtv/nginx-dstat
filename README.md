@@ -88,7 +88,7 @@ Create nginx-dstat.service to /etc/systemd/system/:
 nginx-dstat.service:
 
     [Unit]
-    Description=Wireless Controller
+    Description=NGINX DSTAT
     After=multi-user.target
     
     [Service]
