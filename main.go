@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"html"
 	"io"
 	"log"
 	"net/http"
@@ -24,15 +23,19 @@ import (
 )
 
 var (
-	flagAddr      = flag.String("addr", ":8765", "listen address for the metrics server")
-	flagLog       = flag.String("log", "/var/log/nginx/access.log", "nginx access log path")
-	flagStatus    = flag.String("status", "http://127.0.0.1/nginx_status", "nginx stub_status URL")
-	flagInterval  = flag.Duration("interval", 1500*time.Millisecond, "push interval to WebSocket clients")
-	flagCORS      = flag.String("cors", "*", "CORS origin for the dashboard")
-	flagFromStart = flag.Bool("from-start", false, "tail log from beginning instead of end")
+	flagAddr           = flag.String("addr", ":8765", "listen address for the metrics server")
+	flagLog            = flag.String("log", "/var/log/nginx/access.log", "nginx access log path")
+	flagStatus         = flag.String("status", "http://127.0.0.1/nginx_status", "nginx stub_status URL")
+	flagInterval       = flag.Duration("interval", 1500*time.Millisecond, "push interval to WebSocket clients")
+	flagStatusInterval = flag.Duration("status-interval", 2*time.Second, "stub_status fetch interval")
+	flagCORS           = flag.String("cors", "*", "CORS origin for the dashboard")
+	flagFromStart      = flag.Bool("from-start", false, "tail log from beginning instead of end")
+	flagMaxPaths       = flag.Int("max-paths", 10000, "max unique paths to track before pruning smallest")
 )
 
-var logRe = regexp.MustCompile(`^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"([^"]*)"\s+(\d{3})\s+(\d+|-)`)
+var logRe = regexp.MustCompile(
+	`^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<time>[^\]]+)\]\s+"(?P<req>[^"]*)"\s+(?P<status>\d{3})\s+(?P<bytes>\d+|-)`,
+)
 
 type LogLine struct {
 	IP     string
@@ -48,23 +51,31 @@ func parseLine(line string) (LogLine, bool) {
 	if m == nil {
 		return LogLine{}, false
 	}
-	status, _ := strconv.Atoi(m[4])
-	bytesStr := m[5]
-	var bytes int64
-	if bytesStr != "-" {
-		bytes, _ = strconv.ParseInt(bytesStr, 10, 64)
+	// Use named capture groups via SubexpNames for clarity.
+	names := logRe.SubexpNames()
+	idx := make(map[string]string, len(names))
+	for i, name := range names {
+		if name != "" {
+			idx[name] = m[i]
+		}
 	}
-	t, err := time.Parse("02/Jan/2006:15:04:05 -0700", m[2])
+
+	status, _ := strconv.Atoi(idx["status"])
+	var bytes int64
+	if idx["bytes"] != "-" {
+		bytes, _ = strconv.ParseInt(idx["bytes"], 10, 64)
+	}
+	t, err := time.Parse("02/Jan/2006:15:04:05 -0700", idx["time"])
 	if err != nil {
 		return LogLine{}, false
 	}
-	reqParts := strings.Fields(m[3])
+	reqParts := strings.Fields(idx["req"])
 	method, path := "-", "-"
 	if len(reqParts) >= 2 {
 		method = reqParts[0]
 		path = reqParts[1]
 	}
-	return LogLine{IP: m[1], Time: t.Local(), Method: method, Path: path, Status: status, Bytes: bytes}, true
+	return LogLine{IP: idx["ip"], Time: t.Local(), Method: method, Path: path, Status: status, Bytes: bytes}, true
 }
 
 type StubStatus struct {
@@ -77,7 +88,9 @@ type StubStatus struct {
 	Waiting           int64
 }
 
-var stubRe = regexp.MustCompile(`Active connections:\s+(\d+)[\s\S]+?(\d+)\s+(\d+)\s+(\d+)\s+Reading:\s+(\d+)\s+Writing:\s+(\d+)\s+Waiting:\s+(\d+)`)
+var stubRe = regexp.MustCompile(
+	`Active connections:\s+(\d+)[\s\S]+?(\d+)\s+(\d+)\s+(\d+)\s+Reading:\s+(\d+)\s+Writing:\s+(\d+)\s+Waiting:\s+(\d+)`,
+)
 var stubHTTPClient = &http.Client{Timeout: 2 * time.Second}
 
 func fetchStubStatus(url string) (StubStatus, error) {
@@ -153,10 +166,19 @@ type Snapshot struct {
 	RecentLogs  []LogEntry     `json:"recent_logs"`
 }
 
+// safeConn wraps a WebSocket connection with a mutex for concurrent writes,
+// and a sync.Once to ensure Close is only called once regardless of which
+// goroutine (ping or read) triggers the teardown.
 type safeConn struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
+	conn      *websocket.Conn
+	mu        sync.Mutex
+	closeOnce sync.Once
 }
+
+func (sc *safeConn) close() {
+	sc.closeOnce.Do(func() { sc.conn.Close() })
+}
+
 type Hub struct {
 	mu      sync.RWMutex
 	clients map[*safeConn]struct{}
@@ -174,9 +196,7 @@ func (h *Hub) unregister(sc *safeConn) {
 	h.mu.Lock()
 	delete(h.clients, sc)
 	h.mu.Unlock()
-	sc.mu.Lock()
-	sc.conn.Close()
-	sc.mu.Unlock()
+	sc.close()
 }
 func (h *Hub) broadcast(msg []byte) {
 	h.mu.RLock()
@@ -194,54 +214,89 @@ func (h *Hub) broadcast(msg []byte) {
 	}
 }
 
-func tailLog(path string, out chan<- LogLine) {
+// tailLog tails the nginx access log, re-opening on rotation or missing file.
+// It respects ctx cancellation for clean shutdown.
+func tailLog(ctx context.Context, path string, out chan<- LogLine) {
 	var f *os.File
 	var offset int64
 	open := func() {
-		if f != nil { f.Close() }
+		if f != nil {
+			f.Close()
+		}
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			var err error
 			f, err = os.Open(path)
 			if err == nil {
-				if *flagFromStart { offset = 0 } else { f.Seek(0, io.SeekEnd); offset, _ = f.Seek(0, io.SeekCurrent) }
+				if *flagFromStart {
+					offset = 0
+				} else {
+					f.Seek(0, io.SeekEnd)
+					offset, _ = f.Seek(0, io.SeekCurrent)
+				}
 				log.Printf("tail: opened %s at offset %d", path, offset)
 				return
 			}
 			log.Printf("tail: waiting for %s (%v)", path, err)
-			time.Sleep(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
 		}
 	}
 	open()
 	reader := bufio.NewReader(f)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
-	for range ticker.C {
-		if info, err := os.Stat(path); err == nil {
-			if info.Size() < offset {
-				log.Println("tail: file rotated, re-opening")
-				open()
-				reader = bufio.NewReader(f)
-				continue
+	for {
+		select {
+		case <-ctx.Done():
+			if f != nil {
+				f.Close()
 			}
-		}
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF { break }
-				log.Printf("tail: read error: %v", err)
-				break
+			return
+		case <-ticker.C:
+			if info, err := os.Stat(path); err == nil {
+				if info.Size() < offset {
+					log.Println("tail: file rotated, re-opening")
+					open()
+					reader = bufio.NewReader(f)
+					continue
+				}
 			}
-			line = strings.TrimSpace(line)
-			if line == "" { continue }
-			if l, ok := parseLine(line); ok { out <- l }
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					if err != io.EOF {
+						log.Printf("tail: read error: %v", err)
+					}
+					break
+				}
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				if l, ok := parseLine(line); ok {
+					out <- l
+				}
+			}
+			offset, _ = f.Seek(0, io.SeekCurrent)
 		}
-		offset, _ = f.Seek(0, io.SeekCurrent)
 	}
 }
 
 type StubFetcher struct {
-	mu sync.RWMutex; last StubStatus; url string; interval time.Duration
+	mu       sync.RWMutex
+	last     StubStatus
+	url      string
+	interval time.Duration
 }
+
 func newStubFetcher(url string, interval time.Duration) *StubFetcher {
 	sf := &StubFetcher{url: url, interval: interval}
 	go sf.run()
@@ -252,12 +307,34 @@ func (sf *StubFetcher) run() {
 	defer ticker.Stop()
 	for range ticker.C {
 		if s, err := fetchStubStatus(sf.url); err == nil {
-			sf.mu.Lock(); sf.last = s; sf.mu.Unlock()
+			sf.mu.Lock()
+			sf.last = s
+			sf.mu.Unlock()
 		}
 	}
 }
 func (sf *StubFetcher) Get() StubStatus {
-	sf.mu.RLock(); defer sf.mu.RUnlock(); return sf.last
+	sf.mu.RLock()
+	defer sf.mu.RUnlock()
+	return sf.last
+}
+
+// prunePaths removes the lowest-count entries from pathCounts when it exceeds maxPaths.
+func prunePaths(pathCounts map[string]int, maxPaths int) {
+	if len(pathCounts) <= maxPaths {
+		return
+	}
+	type kv struct{ k string; v int }
+	all := make([]kv, 0, len(pathCounts))
+	for k, v := range pathCounts {
+		all = append(all, kv{k, v})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].v < all[j].v })
+	// Remove the bottom half.
+	for i := 0; i < len(all)/2; i++ {
+		delete(pathCounts, all[i].k)
+	}
+	log.Printf("aggregator: pruned pathCounts from %d to %d entries", len(all), len(pathCounts))
 }
 
 func aggregator(lines <-chan LogLine, hub *Hub, interval time.Duration, stubFetcher *StubFetcher) {
@@ -265,54 +342,104 @@ func aggregator(lines <-chan LogLine, hub *Hub, interval time.Duration, stubFetc
 	pathCounts := make(map[string]int)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	var recentLogs []LogEntry
+
+	// Fixed-size ring buffer for recent log entries (avoids unbounded backing array growth).
+	const maxRecent = 50
+	recentBuf := make([]LogEntry, maxRecent)
+	recentHead := 0
+	recentCount := 0
+
 	hub.broadcast([]byte(`{"ts":"--:--:--","rps":0,"active_conns":0,"reading":0,"writing":0,"waiting":0,"bytes_out_kb":0,"s2xx":0,"s3xx":0,"s4xx":0,"s5xx":0,"err_rate":0,"top_paths":[],"recent_logs":[]}`))
-	
+
 	for {
 		select {
 		case l := <-lines:
 			window.add(l)
 			pathCounts[l.Path]++
-			recentLogs = append(recentLogs, LogEntry{
-				Time: l.Time.Format("15:04:05"), IP: l.IP, Method: l.Method,
-				Path: html.EscapeString(l.Path), Status: l.Status, Bytes: l.Bytes,
-			})
-			if len(recentLogs) > 50 { recentLogs = recentLogs[len(recentLogs)-50:] }
-			
+			// Write into ring buffer (paths are stored raw; JS escapes on render).
+			recentBuf[recentHead] = LogEntry{
+				Time:   l.Time.Format("15:04:05"),
+				IP:     l.IP,
+				Method: l.Method,
+				Path:   l.Path,
+				Status: l.Status,
+				Bytes:  l.Bytes,
+			}
+			recentHead = (recentHead + 1) % maxRecent
+			if recentCount < maxRecent {
+				recentCount++
+			}
+			// Prune path map if it grows too large.
+			if len(pathCounts) > *flagMaxPaths {
+				prunePaths(pathCounts, *flagMaxPaths)
+			}
+
 		case <-ticker.C:
 			batch, bytesOut := window.drain()
 			secs := interval.Seconds()
 			var s2, s3, s4, s5 int
 			for _, l := range batch {
 				switch l.Status / 100 {
-				case 2: s2++; case 3: s3++; case 4: s4++; case 5: s5++
+				case 2:
+					s2++
+				case 3:
+					s3++
+				case 4:
+					s4++
+				case 5:
+					s5++
 				}
 			}
 			stub := stubFetcher.Get()
-			
-			type kv struct { k string; v int }
-			var sorted []kv
-			for k, v := range pathCounts { sorted = append(sorted, kv{k, v}) }
-			sort.Slice(sorted, func(i, j int) bool { return sorted[i].v > sorted[j].v })
-			
-			top := make([]EndpointStat, 0, len(sorted))
-			for i, item := range sorted {
-				if i >= 50 { break }
-				top = append(top, EndpointStat{Path: html.EscapeString(item.k), Count: item.v})
+
+			type kv struct {
+				k string
+				v int
 			}
-			
+			sorted := make([]kv, 0, len(pathCounts))
+			for k, v := range pathCounts {
+				sorted = append(sorted, kv{k, v})
+			}
+			sort.Slice(sorted, func(i, j int) bool { return sorted[i].v > sorted[j].v })
+
+			top := make([]EndpointStat, 0, min(50, len(sorted)))
+			for i, item := range sorted {
+				if i >= 50 {
+					break
+				}
+				// No Go-side HTML escaping — JS handles it on render.
+				top = append(top, EndpointStat{Path: item.k, Count: item.v})
+			}
+
 			totalReqs := s2 + s3 + s4 + s5
 			errRate := 0.0
-			if totalReqs > 0 { errRate = float64(s4+s5) / float64(totalReqs) * 100 }
-			
-			recentSnap := make([]LogEntry, len(recentLogs))
-			for i, v := range recentLogs { recentSnap[len(recentLogs)-1-i] = v }
-			
+			if totalReqs > 0 {
+				errRate = float64(s4+s5) / float64(totalReqs) * 100
+			}
+
+			// Collect ring buffer contents in reverse-chronological order.
+			recentSnap := make([]LogEntry, recentCount)
+			for i := 0; i < recentCount; i++ {
+				// Most recent first: walk backwards from (recentHead-1).
+				idx := (recentHead - 1 - i + maxRecent) % maxRecent
+				recentSnap[i] = recentBuf[idx]
+			}
+
 			snap := Snapshot{
-				Timestamp: time.Now().Format("15:04:05"), RPS: float64(len(batch)) / secs,
-				ActiveConns: stub.ActiveConnections, Reading: stub.Reading, Writing: stub.Writing, Waiting: stub.Waiting,
-				BytesOut: bytesOut / 1024, Status2xx: s2, Status3xx: s3, Status4xx: s4, Status5xx: s5,
-				ErrRate: errRate, TopPaths: top, RecentLogs: recentSnap,
+				Timestamp:   time.Now().Format("15:04:05"),
+				RPS:         float64(len(batch)) / secs,
+				ActiveConns: stub.ActiveConnections,
+				Reading:     stub.Reading,
+				Writing:     stub.Writing,
+				Waiting:     stub.Waiting,
+				BytesOut:    bytesOut / 1024,
+				Status2xx:   s2,
+				Status3xx:   s3,
+				Status4xx:   s4,
+				Status5xx:   s5,
+				ErrRate:     errRate,
+				TopPaths:    top,
+				RecentLogs:  recentSnap,
 			}
 			msg, _ := json.Marshal(snap)
 			hub.broadcast(msg)
@@ -320,34 +447,82 @@ func aggregator(lines <-chan LogLine, hub *Hub, interval time.Duration, stubFetc
 	}
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
 func wsHandler(hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil { log.Println("ws upgrade:", err); return }
+		if err != nil {
+			log.Println("ws upgrade:", err)
+			return
+		}
 		sc := hub.register(conn)
+
+		// Shared done channel so ping and read goroutines coordinate teardown.
+		done := make(chan struct{})
+
+		// Ping goroutine.
 		go func() {
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
-			for range ticker.C {
-				sc.mu.Lock()
-				err := sc.conn.WriteMessage(websocket.PingMessage, nil)
-				sc.mu.Unlock()
-				if err != nil { hub.unregister(sc); return }
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					sc.mu.Lock()
+					err := sc.conn.WriteMessage(websocket.PingMessage, nil)
+					sc.mu.Unlock()
+					if err != nil {
+						hub.unregister(sc)
+						// Signal read goroutine if it hasn't already exited.
+						select {
+						case <-done:
+						default:
+							close(done)
+						}
+						return
+					}
+				}
 			}
 		}()
-		conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(60 * time.Second)); return nil })
+
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			return nil
+		})
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+		// Read loop — blocks until client disconnects.
 		for {
-			if _, _, err := conn.ReadMessage(); err != nil { hub.unregister(sc); return }
+			if _, _, err := conn.ReadMessage(); err != nil {
+				hub.unregister(sc)
+				select {
+				case <-done:
+				default:
+					close(done)
+				}
+				return
+			}
 		}
 	}
 }
+
 func corsMiddleware(next http.Handler, origin string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -357,31 +532,42 @@ func main() {
 	log.Printf("nginx-dstat starting — log=%s status=%s addr=%s", *flagLog, *flagStatus, *flagAddr)
 	hub := newHub()
 	lines := make(chan LogLine, 4096)
-	go tailLog(*flagLog, lines)
-	stubFetcher := newStubFetcher(*flagStatus, 2*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tailLog(ctx, *flagLog, lines)
+	stubFetcher := newStubFetcher(*flagStatus, *flagStatusInterval)
 	go aggregator(lines, hub, *flagInterval, stubFetcher)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler(hub))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json"); fmt.Fprint(w, `{"status":"ok"}`)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"ok"}`)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" { http.NotFound(w, r); return }
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		scheme := "ws"; if r.TLS != nil { scheme = "wss" }
-		fmt.Fprint(w, strings.ReplaceAll(dashboardHTML, "__WS_URL__", fmt.Sprintf("%s://%s/ws", scheme, r.Host)))
+		fmt.Fprint(w, dashboardHTML)
 	})
 	srv := &http.Server{Addr: *flagAddr, Handler: corsMiddleware(mux, *flagCORS)}
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigChan; log.Println("shutting down...")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil { log.Printf("shutdown error: %v", err) }
+		<-sigChan
+		log.Println("shutting down...")
+		cancel()
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutCancel()
+		if err := srv.Shutdown(shutCtx); err != nil {
+			log.Printf("shutdown error: %v", err)
+		}
 	}()
 	log.Printf("listening on %s", *flagAddr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Fatal(err) }
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
 
 const dashboardHTML = `<!DOCTYPE html>
@@ -436,10 +622,6 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;paddi
 .btm{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;}
 @media(max-width:820px){.btm{grid-template-columns:1fr;}}
 #m-waiting{color:var(--purple);}
-.err-rate{font-size:15px;color:var(--amber);font-weight:600;}
-.err-rate.crit{color:var(--red);}
-
-/* Endpoint Layout */
 .ep-layout{display:flex;gap:16px;align-items:center;}
 @media(max-width:900px){.ep-layout{flex-direction:column;align-items:stretch;}}
 .ep-chart{flex:1;min-width:0;position:relative;height:180px;}
@@ -501,42 +683,100 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;paddi
   <div class="log-entries" id="log-list"></div>
 </div>
 <script>
-var N=40,labels=[],rps=[],bw=[],c2=[],c3=[],c4=[],c5=[];
-for(var i=0;i<N;i++){labels.push('');rps.push(0);bw.push(0);c2.push(0);c3.push(0);c4.push(0);c5.push(0);}
+(function () {
+'use strict';
 
-var chartOpts={responsive:true,maintainAspectRatio:false,animation:{duration:180},plugins:{legend:{display:false},tooltip:{backgroundColor:'rgba(11,15,25,0.9)',titleColor:'#e2e8f0',bodyColor:'#94a3b8',borderColor:'rgba(255,255,255,0.1)',borderWidth:1,padding:10,cornerRadius:8,mode:'index',intersect:false}},scales:{x:{display:false},y:{display:true,grid:{color:'rgba(255,255,255,0.04)'},ticks:{font:{size:10,family:'JetBrains Mono'},color:'rgba(255,255,255,0.3)',maxTicksLimit:4}}}};
+/* ── rolling window buffers ───────────────────────────────────────────── */
+var N = 40;
+var labels = [], rpsData = [], bwData = [], c2Data = [], c3Data = [], c4Data = [], c5Data = [];
+for (var i = 0; i < N; i++) {
+  labels.push(''); rpsData.push(0); bwData.push(0);
+  c2Data.push(0); c3Data.push(0); c4Data.push(0); c5Data.push(0);
+}
 
-var cRps=new Chart(document.getElementById('c-rps'),{type:'line',data:{labels:labels,datasets:[{data:rps,borderColor:'#3b82f6',borderWidth:2,fill:true,backgroundColor:'rgba(59,130,246,0.08)',tension:0.4,pointRadius:0}]},options:chartOpts});
-var cBw=new Chart(document.getElementById('c-bw'),{type:'line',data:{labels:labels,datasets:[{data:bw,borderColor:'#22c55e',borderWidth:2,fill:true,backgroundColor:'rgba(34,197,94,0.08)',tension:0.4,pointRadius:0}]},options:chartOpts});
-var cCodes=new Chart(document.getElementById('c-codes'),{type:'line',data:{labels:labels,datasets:[{data:c2,borderColor:'#22c55e',borderWidth:1.5,fill:false,tension:0.4,pointRadius:0},{data:c3,borderColor:'#3b82f6',borderWidth:1.5,fill:false,tension:0.4,pointRadius:0},{data:c4,borderColor:'#f59e0b',borderWidth:1.5,fill:false,tension:0.4,pointRadius:0},{data:c5,borderColor:'#ef4444',borderWidth:1.5,fill:false,tension:0.4,pointRadius:0}]},options:chartOpts});
+/* ── shared chart options ─────────────────────────────────────────────── */
+var chartOpts = {
+  responsive: true, maintainAspectRatio: false,
+  animation: { duration: 180 },
+  plugins: {
+    legend: { display: false },
+    tooltip: {
+      backgroundColor: 'rgba(11,15,25,0.9)', titleColor: '#e2e8f0',
+      bodyColor: '#94a3b8', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1,
+      padding: 10, cornerRadius: 8, mode: 'index', intersect: false
+    }
+  },
+  scales: {
+    x: { display: false },
+    y: {
+      display: true, grid: { color: 'rgba(255,255,255,0.04)' },
+      ticks: { font: { size: 10, family: 'JetBrains Mono' }, color: 'rgba(255,255,255,0.3)', maxTicksLimit: 4 }
+    }
+  }
+};
 
+/* ── FIX: correct Chart.js constructor — data key present, dataset uses data: array ── */
+var cRps = new Chart(document.getElementById('c-rps'), {
+  type: 'line',
+  data: {
+    labels: labels,
+    datasets: [{
+      data: rpsData, borderColor: '#3b82f6', borderWidth: 2,
+      fill: true, backgroundColor: 'rgba(59,130,246,0.08)', tension: 0.4, pointRadius: 0
+    }]
+  },
+  options: chartOpts
+});
+
+var cBw = new Chart(document.getElementById('c-bw'), {
+  type: 'line',
+  data: {
+    labels: labels,
+    datasets: [{
+      data: bwData, borderColor: '#22c55e', borderWidth: 2,
+      fill: true, backgroundColor: 'rgba(34,197,94,0.08)', tension: 0.4, pointRadius: 0
+    }]
+  },
+  options: chartOpts
+});
+
+/* ── FIX: all four datasets now have data: key ───────────────────────── */
+var cCodes = new Chart(document.getElementById('c-codes'), {
+  type: 'line',
+  data: {
+    labels: labels,
+    datasets: [
+      { data: c2Data, borderColor: '#22c55e', borderWidth: 1.5, fill: false, tension: 0.4, pointRadius: 0 },
+      { data: c3Data, borderColor: '#3b82f6', borderWidth: 1.5, fill: false, tension: 0.4, pointRadius: 0 },
+      { data: c4Data, borderColor: '#f59e0b', borderWidth: 1.5, fill: false, tension: 0.4, pointRadius: 0 },
+      { data: c5Data, borderColor: '#ef4444', borderWidth: 1.5, fill: false, tension: 0.4, pointRadius: 0 }
+    ]
+  },
+  options: chartOpts
+});
+
+/* ── center-text plugin for doughnut ─────────────────────────────────── */
 var centerTextPlugin = {
   id: 'centerText',
-  afterDraw: function(chart) {
+  afterDraw: function (chart) {
     var opts = chart.options.plugins.centerText;
-    if (opts && opts.display) {
-      var ctx = chart.ctx;
-      ctx.save();
-      var width = chart.width;
-      var height = chart.height;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      var centerX = width / 2;
-      var centerY = height / 2;
-      ctx.font = "bold 15px 'JetBrains Mono'";
-      ctx.fillStyle = "#e2e8f0";
-      ctx.fillText(opts.text, centerX, centerY - 10);
-      ctx.font = "11px 'JetBrains Mono'";
-      ctx.fillStyle = "#94a3b8";
-      ctx.fillText(opts.subtext, centerX, centerY + 10);
-      ctx.restore();
-    }
+    if (!opts || !opts.display) return;
+    var ctx = chart.ctx;
+    ctx.save();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    var cx = chart.width / 2, cy = chart.height / 2;
+    ctx.font = "bold 15px 'JetBrains Mono'"; ctx.fillStyle = '#e2e8f0';
+    ctx.fillText(opts.text, cx, cy - 10);
+    ctx.font = "11px 'JetBrains Mono'"; ctx.fillStyle = '#94a3b8';
+    ctx.fillText(opts.subtext, cx, cy + 10);
+    ctx.restore();
   }
 };
 Chart.register(centerTextPlugin);
 
-var truncate = function(str, len) { return str && str.length > len ? str.slice(0, len) + '...' : str; };
-var generateColors = function(count) {
+var truncate = function (str, len) { return str && str.length > len ? str.slice(0, len) + '…' : str; };
+
+var generateColors = function (count) {
   var colors = [];
   for (var i = 0; i < count; i++) {
     var hue = (i * 137.508) % 360;
@@ -545,22 +785,27 @@ var generateColors = function(count) {
   return colors;
 };
 
-var cEndpoints=new Chart(document.getElementById('c-endpoints'),{
-  type:'doughnut',
-  data:{labels:[],datasets:[{data:[],backgroundColor:[],borderWidth:0,hoverOffset:10}]},
-  options:{
-    responsive:true,maintainAspectRatio:false,cutout:'65%',
-    plugins:{
+/* ── FIX: doughnut dataset has data: [] key ──────────────────────────── */
+var cEndpoints = new Chart(document.getElementById('c-endpoints'), {
+  type: 'doughnut',
+  data: {
+    labels: [],
+    datasets: [{ data: [], backgroundColor: [], borderWidth: 0, hoverOffset: 10 }]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false, cutout: '65%',
+    plugins: {
       centerText: { display: true, text: 'Waiting', subtext: 'for traffic' },
-      legend:{display:false},
-      tooltip:{
-        backgroundColor:'rgba(11,15,25,0.9)',titleColor:'#e2e8f0',bodyColor:'#94a3b8',
-        borderColor:'rgba(255,255,255,0.1)',borderWidth:1,padding:10,cornerRadius:8,
-        callbacks:{
-          label:function(ctx){
-            var total=ctx.dataset.data.reduce(function(a,b){return a+b;},0);
-            var pct=total>0?((ctx.parsed/total)*100).toFixed(1):0;
-            return ' '+ctx.label+': '+ctx.parsed+' reqs ('+pct+'%)';
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: 'rgba(11,15,25,0.9)', titleColor: '#e2e8f0',
+        bodyColor: '#94a3b8', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1,
+        padding: 10, cornerRadius: 8,
+        callbacks: {
+          label: function (ctx) {
+            var total = ctx.dataset.data.reduce(function (a, b) { return a + b; }, 0);
+            var pct = total > 0 ? ((ctx.parsed / total) * 100).toFixed(1) : 0;
+            return ' ' + ctx.label + ': ' + ctx.parsed + ' reqs (' + pct + '%)';
           }
         }
       }
@@ -568,67 +813,148 @@ var cEndpoints=new Chart(document.getElementById('c-endpoints'),{
   }
 });
 
-var pRps=0,pConn=0,pBout=0,pErr=0,lastLogKeys=new Set();
-function delta(now,prev,unit){var d=now-prev;if(Math.abs(d)<0.5)return '<span class="ne">—</span>';return d>0?'<span class="up">▲ '+Math.abs(d).toFixed(1)+' '+unit+'</span>':'<span class="dn">▼ '+Math.abs(d).toFixed(1)+' '+unit+'</span>';}
-function updateCardThresholds(s){var r=document.getElementById('card-rps'),e=document.getElementById('card-err'),c=document.getElementById('card-conn');r.classList.remove('warn','crit');if(s.rps>100)r.classList.add('crit');else if(s.rps>50)r.classList.add('warn');e.classList.remove('warn','crit');if(s.err_rate>5)e.classList.add('crit');else if(s.err_rate>1)e.classList.add('warn');c.classList.remove('warn','crit');if(s.active_conns>1000)c.classList.add('crit');else if(s.active_conns>500)c.classList.add('warn');}
+/* ── state ────────────────────────────────────────────────────────────── */
+var pRps = 0, pConn = 0, pBout = 0, pErr = 0;
+var lastLogKeys = [];
 
-function update(s){
-  document.getElementById('clock').textContent=s.ts;document.getElementById('sub').textContent='ws connected — nginx live';document.getElementById('dot').classList.remove('off');
-  var rpsVal=+s.rps.toFixed(1);
-  document.getElementById('m-rps').textContent=rpsVal;document.getElementById('m-conn').textContent=s.active_conns;
-  document.getElementById('m-reading').textContent=s.reading;document.getElementById('m-writing').textContent=s.writing;
-  document.getElementById('m-waiting').textContent=s.waiting;document.getElementById('m-bout').textContent=s.bytes_out_kb;
-  var errEl=document.getElementById('m-err');errEl.textContent=s.err_rate.toFixed(1)+'%';errEl.className=s.err_rate>5?'cval crit':s.err_rate>1?'cval warn':'cval';document.getElementById('err-unit').textContent='error rate';
-  document.getElementById('d-rps').innerHTML=delta(rpsVal,pRps,'r/s');document.getElementById('d-conn').innerHTML=delta(s.active_conns,pConn,'');
-  document.getElementById('d-bout').innerHTML=delta(s.bytes_out_kb,pBout,'KB/s');document.getElementById('d-err').innerHTML=delta(s.err_rate,pErr,'%');
-  pRps=rpsVal;pConn=s.active_conns;pBout=s.bytes_out_kb;pErr=s.err_rate;updateCardThresholds(s);
+/* ── helpers ──────────────────────────────────────────────────────────── */
+function delta(now, prev, unit) {
+  var d = now - prev;
+  if (Math.abs(d) < 0.5) return '<span class="ne">—</span>';
+  return d > 0
+    ? '<span class="up">▲ ' + Math.abs(d).toFixed(1) + ' ' + unit + '</span>'
+    : '<span class="dn">▼ ' + Math.abs(d).toFixed(1) + ' ' + unit + '</span>';
+}
 
-  [rps,bw,c2,c3,c4,c5,labels].forEach(function(a){a.shift();});rps.push(rpsVal);bw.push(s.bytes_out_kb);c2.push(s.s2xx);c3.push(s.s3xx);c4.push(s.s4xx);c5.push(s.s5xx);labels.push(s.ts.slice(3));
-  cRps.update('none');cBw.update('none');cCodes.update('none');
+function updateCardThresholds(s) {
+  var r = document.getElementById('card-rps');
+  var e = document.getElementById('card-err');
+  var c = document.getElementById('card-conn');
+  r.classList.remove('warn', 'crit');
+  if (s.rps > 100) r.classList.add('crit'); else if (s.rps > 50) r.classList.add('warn');
+  e.classList.remove('warn', 'crit');
+  if (s.err_rate > 5) e.classList.add('crit'); else if (s.err_rate > 1) e.classList.add('warn');
+  c.classList.remove('warn', 'crit');
+  if (s.active_conns > 1000) c.classList.add('crit'); else if (s.active_conns > 500) c.classList.add('warn');
+}
 
-  if(s.top_paths && s.top_paths.length > 0){
+/* ── FIX: esc() is used for all HTML insertion — no double-escaping from Go ── */
+function esc(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/* ── main update ──────────────────────────────────────────────────────── */
+function update(s) {
+  document.getElementById('clock').textContent = s.ts;
+  document.getElementById('sub').textContent = 'ws connected — nginx live';
+  document.getElementById('dot').classList.remove('off');
+
+  var rpsVal = +s.rps.toFixed(1);
+  document.getElementById('m-rps').textContent = rpsVal;
+  document.getElementById('m-conn').textContent = s.active_conns;
+  document.getElementById('m-reading').textContent = s.reading;
+  document.getElementById('m-writing').textContent = s.writing;
+  document.getElementById('m-waiting').textContent = s.waiting;
+  document.getElementById('m-bout').textContent = s.bytes_out_kb;
+
+  var errEl = document.getElementById('m-err');
+  errEl.textContent = s.err_rate.toFixed(1) + '%';
+  errEl.className = s.err_rate > 5 ? 'cval crit' : s.err_rate > 1 ? 'cval warn' : 'cval';
+  document.getElementById('err-unit').textContent = 'error rate';
+
+  document.getElementById('d-rps').innerHTML = delta(rpsVal, pRps, 'r/s');
+  document.getElementById('d-conn').innerHTML = delta(s.active_conns, pConn, '');
+  document.getElementById('d-bout').innerHTML = delta(s.bytes_out_kb, pBout, 'KB/s');
+  document.getElementById('d-err').innerHTML = delta(s.err_rate, pErr, '%');
+
+  pRps = rpsVal; pConn = s.active_conns; pBout = s.bytes_out_kb; pErr = s.err_rate;
+  updateCardThresholds(s);
+
+  /* rolling window shift */
+  labels.shift(); rpsData.shift(); bwData.shift();
+  c2Data.shift(); c3Data.shift(); c4Data.shift(); c5Data.shift();
+  labels.push(s.ts.slice(3));
+  rpsData.push(rpsVal); bwData.push(s.bytes_out_kb);
+  c2Data.push(s.s2xx); c3Data.push(s.s3xx); c4Data.push(s.s4xx); c5Data.push(s.s5xx);
+  cRps.update('none'); cBw.update('none'); cCodes.update('none');
+
+  /* endpoint doughnut + top-10 list */
+  if (s.top_paths && s.top_paths.length > 0) {
     var paths = s.top_paths;
-    cEndpoints.data.labels = paths.map(function(p){ return p.path; });
-    cEndpoints.data.datasets[0].data = paths.map(function(p){ return p.count; });
+    cEndpoints.data.labels = paths.map(function (p) { return p.path; });
+    cEndpoints.data.datasets[0].data = paths.map(function (p) { return p.count; });
     cEndpoints.data.datasets[0].backgroundColor = generateColors(paths.length);
     cEndpoints.options.plugins.centerText.text = truncate(paths[0].path, 14);
     cEndpoints.options.plugins.centerText.subtext = paths[0].count + ' reqs';
     cEndpoints.update('none');
 
-    // Top 10 List
     var top10 = paths.slice(0, 10);
-    var listHtml = top10.map(function(p, i){
-      return '<div class="ep-row"><span class="ep-rank">#'+(i+1)+'</span><span class="ep-path" title="'+p.path+'">'+truncate(p.path, 30)+'</span><span class="ep-count">'+p.count+'</span></div>';
+    var listHtml = top10.map(function (p, i) {
+      return '<div class="ep-row">'
+        + '<span class="ep-rank">#' + (i + 1) + '</span>'
+        + '<span class="ep-path" title="' + esc(p.path) + '">' + esc(truncate(p.path, 30)) + '</span>'
+        + '<span class="ep-count">' + p.count + '</span>'
+        + '</div>';
     }).join('');
     document.getElementById('ep-top10').innerHTML = listHtml;
   }
 
-  if(s.recent_logs && s.recent_logs.length){
-    var logList=document.getElementById('log-list');var newLogs=s.recent_logs.slice(0,40);var newKeys=new Set(newLogs.map(function(l){return l.time+l.ip+l.method+l.path+l.status;}));
-    if(newKeys.size!==lastLogKeys.size||![...newKeys].every(function(k){return lastLogKeys.has(k);})){
-      var esc=function(str){return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');};
-      logList.innerHTML=newLogs.map(function(l){
-        var sClass = l.status<300?'2':l.status<400?'3':l.status<500?'4':'5';
-        return '<div class="le"><span class="lt">'+esc(l.time)+'</span><span class="lip">'+esc(l.ip)+'</span><span class="lm">'+esc(l.method)+'</span><span class="badge s'+sClass+'">'+l.status+'</span><span class="lp">'+esc(l.path)+'</span><span class="lsz">'+l.bytes+'B</span></div>';
+  /* live log tail */
+  if (s.recent_logs && s.recent_logs.length) {
+    var logList = document.getElementById('log-list');
+    var newLogs = s.recent_logs.slice(0, 40);
+
+    /* FIX: dedup comparison without ES2015 Set spread */
+    var newKey = newLogs.map(function (l) { return l.time + l.ip + l.method + l.path + l.status; }).join('|');
+    var oldKey = lastLogKeys.join('|');
+    if (newKey !== oldKey) {
+      lastLogKeys = newKey.split('|');
+      logList.innerHTML = newLogs.map(function (l) {
+        var sClass = l.status < 300 ? '2' : l.status < 400 ? '3' : l.status < 500 ? '4' : '5';
+        return '<div class="le">'
+          + '<span class="lt">'  + esc(l.time)   + '</span>'
+          + '<span class="lip">' + esc(l.ip)     + '</span>'
+          + '<span class="lm">'  + esc(l.method) + '</span>'
+          + '<span class="badge s' + sClass + '">' + l.status + '</span>'
+          + '<span class="lp">'  + esc(l.path)   + '</span>'
+          + '<span class="lsz">' + l.bytes       + 'B</span>'
+          + '</div>';
       }).join('');
-      lastLogKeys=newKeys;
     }
   }
 }
 
-function connect(){
-  var ws=new WebSocket('__WS_URL__');
-  ws.onopen=function(){console.log('ws connected');};
-  ws.onmessage=function(e){try{update(JSON.parse(e.data));}catch(err){console.error('parse err:',err);}};
-  ws.onclose=function(){
-    document.getElementById('dot').classList.add('off');
-    document.getElementById('sub').textContent='reconnecting…';
-    setTimeout(connect,3000);
-  };
-  ws.onerror=function(err){console.error('ws error:',err);};
+/* ── FIX: WS URL built client-side — no server-injected r.Host ───────── */
+function wsUrl() {
+  var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  return proto + '://' + location.host + '/ws';
 }
+
+function connect() {
+  var ws = new WebSocket(wsUrl());
+  ws.onopen = function () { console.log('ws connected'); };
+  ws.onmessage = function (e) {
+    try { update(JSON.parse(e.data)); } catch (err) { console.error('parse err:', err); }
+  };
+  ws.onclose = function () {
+    document.getElementById('dot').classList.add('off');
+    document.getElementById('sub').textContent = 'reconnecting…';
+    setTimeout(connect, 3000);
+  };
+  ws.onerror = function (err) { console.error('ws error:', err); };
+}
+
 connect();
-setInterval(function(){var n=new Date();document.getElementById('clock').textContent=n.toTimeString().slice(0,8);},1000);
+setInterval(function () {
+  var n = new Date();
+  document.getElementById('clock').textContent = n.toTimeString().slice(0, 8);
+}, 1000);
+
+})();
 </script>
 </body>
 </html>`
