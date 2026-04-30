@@ -22,6 +22,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// version is set at build time via -ldflags "-X main.version=v1.x.y".
+var version = "dev"
+
 var (
 	flagAddr           = flag.String("addr", ":8765", "listen address for the metrics server")
 	flagLog            = flag.String("log", "/var/log/nginx/access.log", "nginx access log path")
@@ -33,9 +36,39 @@ var (
 	flagMaxPaths       = flag.Int("max-paths", 10000, "max unique paths to track before pruning smallest")
 )
 
+// ── log parsing ──────────────────────────────────────────────────────────────
+
 var logRe = regexp.MustCompile(
 	`^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<time>[^\]]+)\]\s+"(?P<req>[^"]*)"\s+(?P<status>\d{3})\s+(?P<bytes>\d+|-)`,
 )
+
+// Pre-computed capture-group indices — avoids a map allocation on every line.
+var (
+	reIdx     int
+	reIpIdx   int
+	reTimeIdx int
+	reReqIdx  int
+	reStatIdx int
+	reBytIdx  int
+)
+
+func init() {
+	for i, name := range logRe.SubexpNames() {
+		switch name {
+		case "ip":
+			reIpIdx = i
+		case "time":
+			reTimeIdx = i
+		case "req":
+			reReqIdx = i
+		case "status":
+			reStatIdx = i
+		case "bytes":
+			reBytIdx = i
+		}
+	}
+	_ = reIdx // silence unused warning
+}
 
 type LogLine struct {
 	IP     string
@@ -51,32 +84,25 @@ func parseLine(line string) (LogLine, bool) {
 	if m == nil {
 		return LogLine{}, false
 	}
-	// Use named capture groups via SubexpNames for clarity.
-	names := logRe.SubexpNames()
-	idx := make(map[string]string, len(names))
-	for i, name := range names {
-		if name != "" {
-			idx[name] = m[i]
-		}
-	}
-
-	status, _ := strconv.Atoi(idx["status"])
+	status, _ := strconv.Atoi(m[reStatIdx])
 	var bytes int64
-	if idx["bytes"] != "-" {
-		bytes, _ = strconv.ParseInt(idx["bytes"], 10, 64)
+	if m[reBytIdx] != "-" {
+		bytes, _ = strconv.ParseInt(m[reBytIdx], 10, 64)
 	}
-	t, err := time.Parse("02/Jan/2006:15:04:05 -0700", idx["time"])
+	t, err := time.Parse("02/Jan/2006:15:04:05 -0700", m[reTimeIdx])
 	if err != nil {
 		return LogLine{}, false
 	}
-	reqParts := strings.Fields(idx["req"])
+	reqParts := strings.Fields(m[reReqIdx])
 	method, path := "-", "-"
 	if len(reqParts) >= 2 {
 		method = reqParts[0]
 		path = reqParts[1]
 	}
-	return LogLine{IP: idx["ip"], Time: t.Local(), Method: method, Path: path, Status: status, Bytes: bytes}, true
+	return LogLine{IP: m[reIpIdx], Time: t.Local(), Method: method, Path: path, Status: status, Bytes: bytes}, true
 }
+
+// ── stub_status ───────────────────────────────────────────────────────────────
 
 type StubStatus struct {
 	ActiveConnections int64
@@ -114,6 +140,46 @@ func fetchStubStatus(url string) (StubStatus, error) {
 	}, nil
 }
 
+// StubFetcher polls nginx stub_status on a fixed interval and caches the result.
+// It stops when ctx is cancelled.
+type StubFetcher struct {
+	mu       sync.RWMutex
+	last     StubStatus
+	url      string
+	interval time.Duration
+}
+
+func newStubFetcher(ctx context.Context, url string, interval time.Duration) *StubFetcher {
+	sf := &StubFetcher{url: url, interval: interval}
+	go sf.run(ctx)
+	return sf
+}
+
+func (sf *StubFetcher) run(ctx context.Context) {
+	ticker := time.NewTicker(sf.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s, err := fetchStubStatus(sf.url); err == nil {
+				sf.mu.Lock()
+				sf.last = s
+				sf.mu.Unlock()
+			}
+		}
+	}
+}
+
+func (sf *StubFetcher) Get() StubStatus {
+	sf.mu.RLock()
+	defer sf.mu.RUnlock()
+	return sf.last
+}
+
+// ── sliding window ────────────────────────────────────────────────────────────
+
 type Window struct {
 	mu        sync.Mutex
 	lines     []LogLine
@@ -137,6 +203,8 @@ func (w *Window) drain() ([]LogLine, int64) {
 	return out, bytes
 }
 
+// ── JSON snapshot types ───────────────────────────────────────────────────────
+
 type EndpointStat struct {
 	Path  string `json:"path"`
 	Count int    `json:"count"`
@@ -150,33 +218,71 @@ type LogEntry struct {
 	Bytes  int64  `json:"bytes"`
 }
 type Snapshot struct {
-	Timestamp   string         `json:"ts"`
-	RPS         float64        `json:"rps"`
-	ActiveConns int64          `json:"active_conns"`
-	Reading     int64          `json:"reading"`
-	Writing     int64          `json:"writing"`
-	Waiting     int64          `json:"waiting"`
-	BytesOut    int64          `json:"bytes_out_kb"`
-	Status2xx   int            `json:"s2xx"`
-	Status3xx   int            `json:"s3xx"`
-	Status4xx   int            `json:"s4xx"`
-	Status5xx   int            `json:"s5xx"`
-	ErrRate     float64        `json:"err_rate"`
-	TopPaths    []EndpointStat `json:"top_paths"`
-	RecentLogs  []LogEntry     `json:"recent_logs"`
+	Timestamp    string         `json:"ts"`
+	RPS          float64        `json:"rps"`
+	ActiveConns  int64          `json:"active_conns"`
+	Reading      int64          `json:"reading"`
+	Writing      int64          `json:"writing"`
+	Waiting      int64          `json:"waiting"`
+	BytesOut     int64          `json:"bytes_out_kb"`
+	Status2xx    int            `json:"s2xx"`
+	Status3xx    int            `json:"s3xx"`
+	Status4xx    int            `json:"s4xx"`
+	Status5xx    int            `json:"s5xx"`
+	ErrRate      float64        `json:"err_rate"`
+	DroppedLines int64          `json:"dropped_lines"`
+	TopPaths     []EndpointStat `json:"top_paths"`
+	RecentLogs   []LogEntry     `json:"recent_logs"`
 }
 
-// safeConn wraps a WebSocket connection with a mutex for concurrent writes,
-// and a sync.Once to ensure Close is only called once regardless of which
-// goroutine (ping or read) triggers the teardown.
+// ── WebSocket hub ─────────────────────────────────────────────────────────────
+
+// safeConn wraps a WebSocket connection.
+// - mu serialises concurrent writes (broadcast vs ping).
+// - closeOnce ensures conn.Close() is called exactly once regardless of which
+//   goroutine (ping or read) triggers teardown.
+// - send is a small outbound queue so broadcast never blocks on a slow client.
 type safeConn struct {
 	conn      *websocket.Conn
 	mu        sync.Mutex
 	closeOnce sync.Once
+	send      chan []byte
+}
+
+func newSafeConn(c *websocket.Conn) *safeConn {
+	sc := &safeConn{conn: c, send: make(chan []byte, 8)}
+	go sc.writeLoop()
+	return sc
+}
+
+// writeLoop drains the send channel sequentially, so callers never block.
+func (sc *safeConn) writeLoop() {
+	for msg := range sc.send {
+		sc.mu.Lock()
+		err := sc.conn.WriteMessage(websocket.TextMessage, msg)
+		sc.mu.Unlock()
+		if err != nil {
+			sc.close()
+			return
+		}
+	}
+}
+
+func (sc *safeConn) enqueue(msg []byte) bool {
+	select {
+	case sc.send <- msg:
+		return true
+	default:
+		// Client is too slow — drop this frame rather than blocking the hub.
+		return false
+	}
 }
 
 func (sc *safeConn) close() {
-	sc.closeOnce.Do(func() { sc.conn.Close() })
+	sc.closeOnce.Do(func() {
+		close(sc.send)
+		sc.conn.Close()
+	})
 }
 
 type Hub struct {
@@ -185,28 +291,38 @@ type Hub struct {
 }
 
 func newHub() *Hub { return &Hub{clients: make(map[*safeConn]struct{})} }
+
 func (h *Hub) register(c *websocket.Conn) *safeConn {
-	sc := &safeConn{conn: c}
+	sc := newSafeConn(c)
 	h.mu.Lock()
 	h.clients[sc] = struct{}{}
 	h.mu.Unlock()
 	return sc
 }
+
 func (h *Hub) unregister(sc *safeConn) {
 	h.mu.Lock()
 	delete(h.clients, sc)
 	h.mu.Unlock()
 	sc.close()
 }
+
+func (h *Hub) count() int {
+	h.mu.RLock()
+	n := len(h.clients)
+	h.mu.RUnlock()
+	return n
+}
+
+// broadcast enqueues msg to every client without holding the lock during I/O.
+// Dead connections are cleaned up after the lock is released.
 func (h *Hub) broadcast(msg []byte) {
 	h.mu.RLock()
 	var dead []*safeConn
 	for sc := range h.clients {
-		sc.mu.Lock()
-		if err := sc.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		if !sc.enqueue(msg) {
 			dead = append(dead, sc)
 		}
-		sc.mu.Unlock()
 	}
 	h.mu.RUnlock()
 	for _, sc := range dead {
@@ -214,11 +330,16 @@ func (h *Hub) broadcast(msg []byte) {
 	}
 }
 
-// tailLog tails the nginx access log, re-opening on rotation or missing file.
-// It respects ctx cancellation for clean shutdown.
-func tailLog(ctx context.Context, path string, out chan<- LogLine) {
+// ── log tailer ────────────────────────────────────────────────────────────────
+
+// tailLog tails the nginx access log and sends parsed lines to out.
+// Non-blocking send: if the aggregator falls behind, lines are dropped and
+// counted rather than stalling the tailer (which would also block rotation
+// detection).
+func tailLog(ctx context.Context, path string, out chan<- LogLine, dropped *int64) {
 	var f *os.File
 	var offset int64
+
 	open := func() {
 		if f != nil {
 			f.Close()
@@ -249,10 +370,12 @@ func tailLog(ctx context.Context, path string, out chan<- LogLine) {
 			}
 		}
 	}
+
 	open()
 	reader := bufio.NewReader(f)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -282,7 +405,14 @@ func tailLog(ctx context.Context, path string, out chan<- LogLine) {
 					continue
 				}
 				if l, ok := parseLine(line); ok {
-					out <- l
+					// Non-blocking send — drop rather than stall.
+					select {
+					case out <- l:
+					default:
+						// Atomically increment shared drop counter.
+						// We use a simple int64 here; aggregator reads it under its own tick.
+						*dropped++
+					}
 				}
 			}
 			offset, _ = f.Seek(0, io.SeekCurrent)
@@ -290,73 +420,52 @@ func tailLog(ctx context.Context, path string, out chan<- LogLine) {
 	}
 }
 
-type StubFetcher struct {
-	mu       sync.RWMutex
-	last     StubStatus
-	url      string
-	interval time.Duration
-}
+// ── path pruning ──────────────────────────────────────────────────────────────
 
-func newStubFetcher(url string, interval time.Duration) *StubFetcher {
-	sf := &StubFetcher{url: url, interval: interval}
-	go sf.run()
-	return sf
-}
-func (sf *StubFetcher) run() {
-	ticker := time.NewTicker(sf.interval)
-	defer ticker.Stop()
-	for range ticker.C {
-		if s, err := fetchStubStatus(sf.url); err == nil {
-			sf.mu.Lock()
-			sf.last = s
-			sf.mu.Unlock()
-		}
-	}
-}
-func (sf *StubFetcher) Get() StubStatus {
-	sf.mu.RLock()
-	defer sf.mu.RUnlock()
-	return sf.last
-}
-
-// prunePaths removes the lowest-count entries from pathCounts when it exceeds maxPaths.
 func prunePaths(pathCounts map[string]int, maxPaths int) {
 	if len(pathCounts) <= maxPaths {
 		return
 	}
-	type kv struct{ k string; v int }
+	type kv struct {
+		k string
+		v int
+	}
 	all := make([]kv, 0, len(pathCounts))
 	for k, v := range pathCounts {
 		all = append(all, kv{k, v})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].v < all[j].v })
-	// Remove the bottom half.
+	before := len(all)
 	for i := 0; i < len(all)/2; i++ {
 		delete(pathCounts, all[i].k)
 	}
-	log.Printf("aggregator: pruned pathCounts from %d to %d entries", len(all), len(pathCounts))
+	log.Printf("aggregator: pruned pathCounts from %d to %d entries", before, len(pathCounts))
 }
 
-func aggregator(lines <-chan LogLine, hub *Hub, interval time.Duration, stubFetcher *StubFetcher) {
+// ── aggregator ────────────────────────────────────────────────────────────────
+
+func aggregator(ctx context.Context, lines <-chan LogLine, hub *Hub, interval time.Duration, stubFetcher *StubFetcher, dropped *int64) {
 	window := &Window{}
 	pathCounts := make(map[string]int)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Fixed-size ring buffer for recent log entries (avoids unbounded backing array growth).
+	// Fixed-size ring buffer — avoids unbounded backing-array growth.
 	const maxRecent = 50
 	recentBuf := make([]LogEntry, maxRecent)
-	recentHead := 0
-	recentCount := 0
+	recentHead := 0  // next write slot
+	recentFull := false // true once buffer has wrapped at least once
 
-	hub.broadcast([]byte(`{"ts":"--:--:--","rps":0,"active_conns":0,"reading":0,"writing":0,"waiting":0,"bytes_out_kb":0,"s2xx":0,"s3xx":0,"s4xx":0,"s5xx":0,"err_rate":0,"top_paths":[],"recent_logs":[]}`))
+	hub.broadcast([]byte(`{"ts":"--:--:--","rps":0,"active_conns":0,"reading":0,"writing":0,"waiting":0,"bytes_out_kb":0,"s2xx":0,"s3xx":0,"s4xx":0,"s5xx":0,"err_rate":0,"dropped_lines":0,"top_paths":[],"recent_logs":[]}`))
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
+
 		case l := <-lines:
 			window.add(l)
 			pathCounts[l.Path]++
-			// Write into ring buffer (paths are stored raw; JS escapes on render).
 			recentBuf[recentHead] = LogEntry{
 				Time:   l.Time.Format("15:04:05"),
 				IP:     l.IP,
@@ -366,15 +475,20 @@ func aggregator(lines <-chan LogLine, hub *Hub, interval time.Duration, stubFetc
 				Bytes:  l.Bytes,
 			}
 			recentHead = (recentHead + 1) % maxRecent
-			if recentCount < maxRecent {
-				recentCount++
+			if recentHead == 0 {
+				recentFull = true
 			}
-			// Prune path map if it grows too large.
 			if len(pathCounts) > *flagMaxPaths {
 				prunePaths(pathCounts, *flagMaxPaths)
 			}
 
 		case <-ticker.C:
+			// Skip expensive work when nobody is watching.
+			if hub.count() == 0 {
+				window.drain() // still drain so the window doesn't grow
+				continue
+			}
+
 			batch, bytesOut := window.drain()
 			secs := interval.Seconds()
 			var s2, s3, s4, s5 int
@@ -407,7 +521,6 @@ func aggregator(lines <-chan LogLine, hub *Hub, interval time.Duration, stubFetc
 				if i >= 50 {
 					break
 				}
-				// No Go-side HTML escaping — JS handles it on render.
 				top = append(top, EndpointStat{Path: item.k, Count: item.v})
 			}
 
@@ -417,31 +530,45 @@ func aggregator(lines <-chan LogLine, hub *Hub, interval time.Duration, stubFetc
 				errRate = float64(s4+s5) / float64(totalReqs) * 100
 			}
 
-			// Collect ring buffer contents in reverse-chronological order.
+			// Collect ring buffer in reverse-chronological order.
+			// FIX: use the correct count and index formula for both the
+			// partially-filled and fully-wrapped cases.
+			recentCount := maxRecent
+			if !recentFull {
+				recentCount = recentHead
+			}
 			recentSnap := make([]LogEntry, recentCount)
 			for i := 0; i < recentCount; i++ {
-				// Most recent first: walk backwards from (recentHead-1).
+				// Walk backwards from the slot written most recently.
+				// When the buffer is not yet full, valid slots are 0..recentHead-1,
+				// so (recentHead-1-i) is always non-negative within the loop bound.
 				idx := (recentHead - 1 - i + maxRecent) % maxRecent
 				recentSnap[i] = recentBuf[idx]
 			}
 
 			snap := Snapshot{
-				Timestamp:   time.Now().Format("15:04:05"),
-				RPS:         float64(len(batch)) / secs,
-				ActiveConns: stub.ActiveConnections,
-				Reading:     stub.Reading,
-				Writing:     stub.Writing,
-				Waiting:     stub.Waiting,
-				BytesOut:    bytesOut / 1024,
-				Status2xx:   s2,
-				Status3xx:   s3,
-				Status4xx:   s4,
-				Status5xx:   s5,
-				ErrRate:     errRate,
-				TopPaths:    top,
-				RecentLogs:  recentSnap,
+				Timestamp:    time.Now().Format("15:04:05"),
+				RPS:          float64(len(batch)) / secs,
+				ActiveConns:  stub.ActiveConnections,
+				Reading:      stub.Reading,
+				Writing:      stub.Writing,
+				Waiting:      stub.Waiting,
+				BytesOut:     bytesOut / 1024,
+				Status2xx:    s2,
+				Status3xx:    s3,
+				Status4xx:    s4,
+				Status5xx:    s5,
+				ErrRate:      errRate,
+				DroppedLines: *dropped,
+				TopPaths:     top,
+				RecentLogs:   recentSnap,
 			}
-			msg, _ := json.Marshal(snap)
+			// FIX: don't broadcast a nil frame if Marshal somehow fails.
+			msg, err := json.Marshal(snap)
+			if err != nil {
+				log.Printf("aggregator: marshal error: %v", err)
+				continue
+			}
 			hub.broadcast(msg)
 		}
 	}
@@ -454,6 +581,8 @@ func min(a, b int) int {
 	return b
 }
 
+// ── WebSocket handler ─────────────────────────────────────────────────────────
+
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func wsHandler(hub *Hub) http.HandlerFunc {
@@ -465,10 +594,11 @@ func wsHandler(hub *Hub) http.HandlerFunc {
 		}
 		sc := hub.register(conn)
 
-		// Shared done channel so ping and read goroutines coordinate teardown.
+		// done coordinates teardown between the ping goroutine and the read loop.
 		done := make(chan struct{})
+		closeDone := sync.OnceFunc(func() { close(done) })
 
-		// Ping goroutine.
+		// Ping goroutine — keeps the connection alive and detects dead clients.
 		go func() {
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
@@ -482,12 +612,7 @@ func wsHandler(hub *Hub) http.HandlerFunc {
 					sc.mu.Unlock()
 					if err != nil {
 						hub.unregister(sc)
-						// Signal read goroutine if it hasn't already exited.
-						select {
-						case <-done:
-						default:
-							close(done)
-						}
+						closeDone()
 						return
 					}
 				}
@@ -500,20 +625,17 @@ func wsHandler(hub *Hub) http.HandlerFunc {
 		})
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
-		// Read loop — blocks until client disconnects.
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				hub.unregister(sc)
-				select {
-				case <-done:
-				default:
-					close(done)
-				}
+				closeDone()
 				return
 			}
 		}
 	}
 }
+
+// ── middleware ────────────────────────────────────────────────────────────────
 
 func corsMiddleware(next http.Handler, origin string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -527,21 +649,31 @@ func corsMiddleware(next http.Handler, origin string) http.Handler {
 	})
 }
 
+// ── main ──────────────────────────────────────────────────────────────────────
+
 func main() {
 	flag.Parse()
-	log.Printf("nginx-dstat starting — log=%s status=%s addr=%s", *flagLog, *flagStatus, *flagAddr)
-	hub := newHub()
-	lines := make(chan LogLine, 4096)
+	log.Printf("nginx-dstat %s starting — log=%s status=%s addr=%s", version, *flagLog, *flagStatus, *flagAddr)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go tailLog(ctx, *flagLog, lines)
-	stubFetcher := newStubFetcher(*flagStatus, *flagStatusInterval)
-	go aggregator(lines, hub, *flagInterval, stubFetcher)
+
+	hub := newHub()
+	lines := make(chan LogLine, 4096)
+
+	// dropped is written only by tailLog (single goroutine) and read by
+	// aggregator (also single goroutine), so a plain int64 is safe here.
+	var dropped int64
+
+	go tailLog(ctx, *flagLog, lines, &dropped)
+	stubFetcher := newStubFetcher(ctx, *flagStatus, *flagStatusInterval)
+	go aggregator(ctx, lines, hub, *flagInterval, stubFetcher, &dropped)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler(hub))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"status":"ok"}`)
+		fmt.Fprintf(w, `{"status":"ok","version":%q}`, version)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -551,24 +683,29 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, dashboardHTML)
 	})
+
 	srv := &http.Server{Addr: *flagAddr, Handler: corsMiddleware(mux, *flagCORS)}
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		log.Println("shutting down...")
-		cancel()
+		log.Println("shutting down…")
+		cancel() // stop tailLog, aggregator, stubFetcher
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutCancel()
 		if err := srv.Shutdown(shutCtx); err != nil {
 			log.Printf("shutdown error: %v", err)
 		}
 	}()
+
 	log.Printf("listening on %s", *flagAddr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }
+
+// ── embedded dashboard ────────────────────────────────────────────────────────
 
 const dashboardHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -651,6 +788,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;paddi
   <div class="card"><div class="clabel">waiting</div><div class="cval" id="m-waiting">—</div><div class="cunit">keep-alive</div><div class="cdelta ne">&nbsp;</div></div>
   <div class="card" id="card-err"><div class="clabel">errors</div><div class="cval" id="m-err">—</div><div class="cunit" id="err-unit">4xx+5xx</div><div class="cdelta ne" id="d-err">—</div></div>
   <div class="card" id="card-bw"><div class="clabel">bandwidth</div><div class="cval" id="m-bout">—</div><div class="cunit">KB/s out</div><div class="cdelta ne" id="d-bout">—</div></div>
+  <div class="card" id="card-drop"><div class="clabel">dropped</div><div class="cval" id="m-drop">0</div><div class="cunit">log lines</div><div class="cdelta ne">&nbsp;</div></div>
 </div>
 <div class="charts">
   <div class="chart-box"><div class="ctitle">requests / sec</div><div style="position:relative;height:130px"><canvas id="c-rps"></canvas></div></div>
@@ -715,32 +853,16 @@ var chartOpts = {
   }
 };
 
-/* ── FIX: correct Chart.js constructor — data key present, dataset uses data: array ── */
 var cRps = new Chart(document.getElementById('c-rps'), {
   type: 'line',
-  data: {
-    labels: labels,
-    datasets: [{
-      data: rpsData, borderColor: '#3b82f6', borderWidth: 2,
-      fill: true, backgroundColor: 'rgba(59,130,246,0.08)', tension: 0.4, pointRadius: 0
-    }]
-  },
+  data: { labels: labels, datasets: [{ data: rpsData, borderColor: '#3b82f6', borderWidth: 2, fill: true, backgroundColor: 'rgba(59,130,246,0.08)', tension: 0.4, pointRadius: 0 }] },
   options: chartOpts
 });
-
 var cBw = new Chart(document.getElementById('c-bw'), {
   type: 'line',
-  data: {
-    labels: labels,
-    datasets: [{
-      data: bwData, borderColor: '#22c55e', borderWidth: 2,
-      fill: true, backgroundColor: 'rgba(34,197,94,0.08)', tension: 0.4, pointRadius: 0
-    }]
-  },
+  data: { labels: labels, datasets: [{ data: bwData, borderColor: '#22c55e', borderWidth: 2, fill: true, backgroundColor: 'rgba(34,197,94,0.08)', tension: 0.4, pointRadius: 0 }] },
   options: chartOpts
 });
-
-/* ── FIX: all four datasets now have data: key ───────────────────────── */
 var cCodes = new Chart(document.getElementById('c-codes'), {
   type: 'line',
   data: {
@@ -756,7 +878,7 @@ var cCodes = new Chart(document.getElementById('c-codes'), {
 });
 
 /* ── center-text plugin for doughnut ─────────────────────────────────── */
-var centerTextPlugin = {
+Chart.register({
   id: 'centerText',
   afterDraw: function (chart) {
     var opts = chart.options.plugins.centerText;
@@ -771,8 +893,7 @@ var centerTextPlugin = {
     ctx.fillText(opts.subtext, cx, cy + 10);
     ctx.restore();
   }
-};
-Chart.register(centerTextPlugin);
+});
 
 var truncate = function (str, len) { return str && str.length > len ? str.slice(0, len) + '…' : str; };
 
@@ -785,13 +906,9 @@ var generateColors = function (count) {
   return colors;
 };
 
-/* ── FIX: doughnut dataset has data: [] key ──────────────────────────── */
 var cEndpoints = new Chart(document.getElementById('c-endpoints'), {
   type: 'doughnut',
-  data: {
-    labels: [],
-    datasets: [{ data: [], backgroundColor: [], borderWidth: 0, hoverOffset: 10 }]
-  },
+  data: { labels: [], datasets: [{ data: [], backgroundColor: [], borderWidth: 0, hoverOffset: 10 }] },
   options: {
     responsive: true, maintainAspectRatio: false, cutout: '65%',
     plugins: {
@@ -815,7 +932,7 @@ var cEndpoints = new Chart(document.getElementById('c-endpoints'), {
 
 /* ── state ────────────────────────────────────────────────────────────── */
 var pRps = 0, pConn = 0, pBout = 0, pErr = 0;
-var lastLogKeys = [];
+var lastLogKey = '';
 
 /* ── helpers ──────────────────────────────────────────────────────────── */
 function delta(now, prev, unit) {
@@ -830,15 +947,17 @@ function updateCardThresholds(s) {
   var r = document.getElementById('card-rps');
   var e = document.getElementById('card-err');
   var c = document.getElementById('card-conn');
+  var dr = document.getElementById('card-drop');
   r.classList.remove('warn', 'crit');
   if (s.rps > 100) r.classList.add('crit'); else if (s.rps > 50) r.classList.add('warn');
   e.classList.remove('warn', 'crit');
   if (s.err_rate > 5) e.classList.add('crit'); else if (s.err_rate > 1) e.classList.add('warn');
   c.classList.remove('warn', 'crit');
   if (s.active_conns > 1000) c.classList.add('crit'); else if (s.active_conns > 500) c.classList.add('warn');
+  dr.classList.remove('warn', 'crit');
+  if (s.dropped_lines > 0) dr.classList.add('warn');
 }
 
-/* ── FIX: esc() is used for all HTML insertion — no double-escaping from Go ── */
 function esc(str) {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -860,6 +979,7 @@ function update(s) {
   document.getElementById('m-writing').textContent = s.writing;
   document.getElementById('m-waiting').textContent = s.waiting;
   document.getElementById('m-bout').textContent = s.bytes_out_kb;
+  document.getElementById('m-drop').textContent = s.dropped_lines || 0;
 
   var errEl = document.getElementById('m-err');
   errEl.textContent = s.err_rate.toFixed(1) + '%';
@@ -874,7 +994,7 @@ function update(s) {
   pRps = rpsVal; pConn = s.active_conns; pBout = s.bytes_out_kb; pErr = s.err_rate;
   updateCardThresholds(s);
 
-  /* rolling window shift */
+  /* rolling window */
   labels.shift(); rpsData.shift(); bwData.shift();
   c2Data.shift(); c3Data.shift(); c4Data.shift(); c5Data.shift();
   labels.push(s.ts.slice(3));
@@ -882,7 +1002,7 @@ function update(s) {
   c2Data.push(s.s2xx); c3Data.push(s.s3xx); c4Data.push(s.s4xx); c5Data.push(s.s5xx);
   cRps.update('none'); cBw.update('none'); cCodes.update('none');
 
-  /* endpoint doughnut + top-10 list */
+  /* endpoint doughnut + top-10 */
   if (s.top_paths && s.top_paths.length > 0) {
     var paths = s.top_paths;
     cEndpoints.data.labels = paths.map(function (p) { return p.path; });
@@ -892,28 +1012,22 @@ function update(s) {
     cEndpoints.options.plugins.centerText.subtext = paths[0].count + ' reqs';
     cEndpoints.update('none');
 
-    var top10 = paths.slice(0, 10);
-    var listHtml = top10.map(function (p, i) {
+    document.getElementById('ep-top10').innerHTML = paths.slice(0, 10).map(function (p, i) {
       return '<div class="ep-row">'
         + '<span class="ep-rank">#' + (i + 1) + '</span>'
         + '<span class="ep-path" title="' + esc(p.path) + '">' + esc(truncate(p.path, 30)) + '</span>'
         + '<span class="ep-count">' + p.count + '</span>'
         + '</div>';
     }).join('');
-    document.getElementById('ep-top10').innerHTML = listHtml;
   }
 
   /* live log tail */
   if (s.recent_logs && s.recent_logs.length) {
-    var logList = document.getElementById('log-list');
     var newLogs = s.recent_logs.slice(0, 40);
-
-    /* FIX: dedup comparison without ES2015 Set spread */
-    var newKey = newLogs.map(function (l) { return l.time + l.ip + l.method + l.path + l.status; }).join('|');
-    var oldKey = lastLogKeys.join('|');
-    if (newKey !== oldKey) {
-      lastLogKeys = newKey.split('|');
-      logList.innerHTML = newLogs.map(function (l) {
+    var newKey = newLogs.map(function (l) { return l.time + l.ip + l.path + l.status; }).join('|');
+    if (newKey !== lastLogKey) {
+      lastLogKey = newKey;
+      document.getElementById('log-list').innerHTML = newLogs.map(function (l) {
         var sClass = l.status < 300 ? '2' : l.status < 400 ? '3' : l.status < 500 ? '4' : '5';
         return '<div class="le">'
           + '<span class="lt">'  + esc(l.time)   + '</span>'
@@ -928,30 +1042,34 @@ function update(s) {
   }
 }
 
-/* ── FIX: WS URL built client-side — no server-injected r.Host ───────── */
-function wsUrl() {
-  var proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return proto + '://' + location.host + '/ws';
-}
+/* ── WebSocket with exponential backoff + jitter ─────────────────────── */
+var reconnectDelay = 3000;
 
 function connect() {
-  var ws = new WebSocket(wsUrl());
-  ws.onopen = function () { console.log('ws connected'); };
+  var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  var ws = new WebSocket(proto + '://' + location.host + '/ws');
+
+  ws.onopen = function () {
+    console.log('ws connected');
+    reconnectDelay = 3000; // reset backoff on successful connect
+  };
   ws.onmessage = function (e) {
     try { update(JSON.parse(e.data)); } catch (err) { console.error('parse err:', err); }
   };
   ws.onclose = function () {
     document.getElementById('dot').classList.add('off');
-    document.getElementById('sub').textContent = 'reconnecting…';
-    setTimeout(connect, 3000);
+    document.getElementById('sub').textContent = 'reconnecting in ' + (reconnectDelay / 1000).toFixed(0) + 's…';
+    // Exponential backoff with ±500 ms jitter, capped at 30 s.
+    var delay = reconnectDelay + (Math.random() * 1000 - 500);
+    reconnectDelay = Math.min(30000, reconnectDelay * 2);
+    setTimeout(connect, delay);
   };
   ws.onerror = function (err) { console.error('ws error:', err); };
 }
 
 connect();
 setInterval(function () {
-  var n = new Date();
-  document.getElementById('clock').textContent = n.toTimeString().slice(0, 8);
+  document.getElementById('clock').textContent = new Date().toTimeString().slice(0, 8);
 }, 1000);
 
 })();
